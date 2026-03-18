@@ -101,6 +101,12 @@ def elemento_a_string(elemento):
     texto = re.sub(r"<description\b[^>]*>.*?</description>", "", texto, flags=re.DOTALL)
     texto = re.sub(r"<description\s*/>", "", texto)
 
+    # ── 2b. Quitar <ExtendedData> ──────────────────────────────
+    #    Google Earth muestra los campos de ExtendedData (como altura,
+    #    material, propietario, etc.) como tabla en el popup del pin.
+    texto = re.sub(r"<ExtendedData\b[^>]*>.*?</ExtendedData>", "", texto, flags=re.DOTALL)
+    texto = re.sub(r"<ExtendedData\s*/>", "", texto)
+
     # ── 3. Quitar <styleUrl> y <Style> del Placemark original ─
     #    Sin esto, el estilo viejo puede sobrescribir el nuevo
     texto = re.sub(r"<styleUrl\b[^>]*>.*?</styleUrl>", "", texto, flags=re.DOTALL)
