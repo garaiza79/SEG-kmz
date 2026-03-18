@@ -1,5 +1,5 @@
 """
-Creación de KMZ del SEG - CFE  (v2.0)
+Creación de KMZ del SEG - CFE  (v2.1)
 ═══════════════════════════════════════
 Convierte un KMZ de proyecto al formato requerido por el SEG.
 Con intersección espacial opcional para detectar Entidad y Municipio.
@@ -14,10 +14,9 @@ import zipfile
 import xml.etree.ElementTree as ET
 from io import BytesIO
 import re
-from collections import defaultdict, Counter
+from collections import defaultdict
 
 # ─── Registrar namespaces KML ────────────────────────────────
-# Importante hacerlo antes de cualquier parseo con ET
 ET.register_namespace("",     "http://www.opengis.net/kml/2.2")
 ET.register_namespace("gx",   "http://www.google.com/kml/ext/2.2")
 ET.register_namespace("atom", "http://www.w3.org/2005/Atom")
@@ -60,9 +59,9 @@ def coords_str_to_list(coords_str):
 def elemento_a_string(elemento):
     """
     Convierte un elemento XML a string KML limpio:
-      - Quita los prefijos de namespace (kml:, ns0:)
-      - Elimina el bloque <description> completo
-      - Actualiza el <styleUrl> según el tipo de geometría
+      - Quita prefijos de namespace (kml:, ns0:)
+      - Elimina el bloque <description> completo  ← sin descripción
+      - Actualiza <styleUrl> según el tipo de geometría
     """
     texto = ET.tostring(elemento, encoding="unicode")
 
@@ -72,11 +71,11 @@ def elemento_a_string(elemento):
     texto = re.sub(r"<kml:", "<", texto)
     texto = re.sub(r"</kml:", "</", texto)
 
-    # ── Quitar <description> (con todo su contenido) ──────────
+    # ── Quitar <description> con todo su contenido ────────────
     texto = re.sub(r"<description>.*?</description>", "", texto, flags=re.DOTALL)
     texto = re.sub(r"<description\s*/>", "", texto)
 
-    # ── Actualizar styleUrl según geometría ───────────────────
+    # ── Actualizar styleUrl según tipo de geometría ───────────
     if "<LineString>" in texto:
         nuevo_estilo = "#estilo_trayectoria"
     else:
@@ -98,15 +97,6 @@ def elemento_a_string(elemento):
 def parse_kmz_proyecto(file_bytes):
     """
     Lee el KMZ del proyecto y extrae todos los Placemarks (puntos y líneas).
-
-    Retorna una lista de dicts con:
-      id      → número único
-      name    → nombre del placemark
-      tipo    → "Línea" | "Punto" | "Otro"
-      path    → ruta de carpetas de origen (ej. "Proyecto / Postes / CFE")
-      coords  → lista de (lon, lat) para cálculo de intersección
-      element → elemento XML original
-      municipio → None (se llenará si hay intersección espacial)
     """
     with zipfile.ZipFile(BytesIO(file_bytes)) as z:
         kml_file = next((n for n in z.namelist() if n.endswith(".kml")), None)
@@ -118,7 +108,7 @@ def parse_kmz_proyecto(file_bytes):
     document = root.find(f"{{{KML}}}Document") or root
 
     placemarks = []
-    contador   = [0]   # lista para poder modificarla desde la función anidada
+    contador   = [0]
 
     def extraer(elemento, ruta=""):
         for hijo in elemento:
@@ -131,10 +121,9 @@ def parse_kmz_proyecto(file_bytes):
                 extraer(hijo, nueva_ruta)
 
             elif tag == "Placemark":
-                n     = hijo.find(f"{{{KML}}}name")
+                n      = hijo.find(f"{{{KML}}}name")
                 nombre = n.text if n is not None else "Sin nombre"
 
-                # Determinar tipo de geometría y extraer coordenadas
                 coords_el = hijo.find(f".//{{{KML}}}coordinates")
                 coords    = coords_str_to_list(coords_el.text) if coords_el is not None else []
 
@@ -153,7 +142,7 @@ def parse_kmz_proyecto(file_bytes):
                     "path":      ruta,
                     "coords":    coords,
                     "element":   hijo,
-                    "municipio": None,   # se llenará en calcular_interseccion()
+                    "municipio": None,
                 })
 
     extraer(document)
@@ -168,20 +157,12 @@ def parse_kmz_proyecto(file_bytes):
 def parse_kmz_municipios(file_bytes):
     """
     Lee el KMZ de municipios (INEGI/CONABIO) y extrae los polígonos.
-
-    Retorna lista de dicts:
-      cve_ent, nom_ent → estado
-      cve_mun, nom_mun → municipio
-      poligonos        → lista de listas de coordenadas (para crear shapely después)
-
-    Usa @st.cache_data para no reprocesar el archivo cada vez que el
-    usuario interactúa con la app (el archivo pesa ~91 MB).
+    Usa @st.cache_data para no reprocesar el archivo en cada interacción.
     """
     with zipfile.ZipFile(BytesIO(file_bytes)) as z:
-        kml_file   = next((n for n in z.namelist() if n.endswith(".kml")), None)
+        kml_file    = next((n for n in z.namelist() if n.endswith(".kml")), None)
         kml_content = z.read(kml_file).decode("utf-8")
 
-    # Regex para extraer cada Placemark completo (más rápido que ET en archivos enormes)
     placemarks_raw = re.findall(
         r"<Placemark[^>]*>.*?</Placemark>", kml_content, re.DOTALL
     )
@@ -196,7 +177,6 @@ def parse_kmz_municipios(file_bytes):
         if not (nom_ent and nom_mun):
             continue
 
-        # Extraer los polígonos del municipio
         poligonos_coords = []
         for poly_str in re.findall(r"<Polygon>.*?</Polygon>", pm, re.DOTALL):
             outer = re.search(
@@ -226,17 +206,13 @@ def parse_kmz_municipios(file_bytes):
 
 def calcular_interseccion(placemarks, municipios_data):
     """
-    Para cada Placemark, detecta en qué municipio se encuentra:
-      - Punto  → polígono que lo contiene (o el más cercano si está en frontera)
-      - Línea  → municipio donde la línea tiene mayor longitud de intersección
-
-    Actualiza el campo 'municipio' de cada placemark con un dict:
-      {cve_ent, nom_ent, cve_mun, nom_mun}
+    Para cada Placemark detecta en qué municipio se encuentra:
+      - Punto → polígono que lo contiene (o el más cercano)
+      - Línea → municipio con mayor longitud de intersección
     """
     if not SHAPELY:
         return placemarks
 
-    # Construir geometrías shapely para todos los municipios
     geoms_shapely = []
     for mun in municipios_data:
         polys = []
@@ -245,73 +221,52 @@ def calcular_interseccion(placemarks, municipios_data):
                 polys.append(Polygon(coords))
             except Exception:
                 pass
-        if polys:
-            geom = unary_union(polys) if len(polys) > 1 else polys[0]
-        else:
-            geom = None
+        geom = unary_union(polys) if polys else None
         geoms_shapely.append(geom)
 
-    # Filtrar municipios sin geometría válida
-    pares_validos = [(i, g) for i, g in enumerate(geoms_shapely) if g is not None]
+    pares_validos  = [(i, g) for i, g in enumerate(geoms_shapely) if g is not None]
     indices_reales = [i for i, _ in pares_validos]
     geoms_validas  = [g for _, g in pares_validos]
 
-    # Construir índice espacial STRtree para búsqueda rápida
     tree = STRtree(geoms_validas)
 
-    # Procesar cada Placemark
     for pm in placemarks:
         if not pm["coords"]:
             continue
-
         try:
             if pm["tipo"] == "Punto":
-                shapely_geom = Point(pm["coords"][0])
-
-                # Buscar candidatos cercanos con STRtree
-                candidatos = list(tree.query(shapely_geom))
-
+                sg        = Point(pm["coords"][0])
+                candidatos = list(tree.query(sg))
                 mejor = None
-                for idx_local in candidatos:
-                    idx_real = indices_reales[idx_local]
-                    mun_geom = geoms_shapely[idx_real]
-                    # Contiene o está muy cerca (tolerancia por fronteras)
-                    if mun_geom.contains(shapely_geom) or mun_geom.distance(shapely_geom) < 0.001:
-                        mejor = municipios_data[idx_real]
+                for ic in candidatos:
+                    ir = indices_reales[ic]
+                    if geoms_shapely[ir].contains(sg) or geoms_shapely[ir].distance(sg) < 0.001:
+                        mejor = municipios_data[ir]
                         break
-
-                # Si no encontró exacto, usar el municipio más cercano
                 if mejor is None and candidatos:
-                    dist_min = float("inf")
-                    for idx_local in candidatos:
-                        idx_real = indices_reales[idx_local]
-                        d = geoms_shapely[idx_real].distance(shapely_geom)
-                        if d < dist_min:
-                            dist_min = d
-                            mejor = municipios_data[idx_real]
-
+                    d_min = float("inf")
+                    for ic in candidatos:
+                        ir = indices_reales[ic]
+                        d  = geoms_shapely[ir].distance(sg)
+                        if d < d_min:
+                            d_min = d
+                            mejor = municipios_data[ir]
                 pm["municipio"] = mejor
 
             elif pm["tipo"] == "Línea" and len(pm["coords"]) >= 2:
-                shapely_geom = LineString(pm["coords"])
-                candidatos   = list(tree.query(shapely_geom))
-
-                mejor         = None
-                mejor_longitud = 0.0
-
-                for idx_local in candidatos:
-                    idx_real = indices_reales[idx_local]
-                    mun_geom = geoms_shapely[idx_real]
+                sg         = LineString(pm["coords"])
+                candidatos = list(tree.query(sg))
+                mejor      = None
+                mejor_lon  = 0.0
+                for ic in candidatos:
+                    ir = indices_reales[ic]
                     try:
-                        interseccion = shapely_geom.intersection(mun_geom)
-                        if not interseccion.is_empty:
-                            longitud = interseccion.length
-                            if longitud > mejor_longitud:
-                                mejor_longitud = longitud
-                                mejor = municipios_data[idx_real]
+                        inter = sg.intersection(geoms_shapely[ir])
+                        if not inter.is_empty and inter.length > mejor_lon:
+                            mejor_lon = inter.length
+                            mejor     = municipios_data[ir]
                     except Exception:
                         pass
-
                 pm["municipio"] = mejor
 
         except Exception:
@@ -321,28 +276,34 @@ def calcular_interseccion(placemarks, municipios_data):
 
 
 # ══════════════════════════════════════════════════════════════
-# FUNCIÓN 4: GENERAR KMZ DE SALIDA
+# ESTILOS KML
 # ══════════════════════════════════════════════════════════════
+# Colores en KML usan formato AABBGGRR (hexadecimal):
+#   A = Alpha (opacidad)  ff = totalmente opaco
+#   B = Blue              G = Green    R = Red
+#
+#   Rojo  puro → A=ff, B=00, G=00, R=ff → "ff0000ff"
+#   Azul  puro → A=ff, B=ff, G=00, R=00 → "ffff0000"
+#   Verde puro → A=ff, B=00, G=ff, R=00 → "ff00ff00"
 
-# ── Bloque de estilos KML ─────────────────────────────────────
-# Color azul: en KML el formato es AABBGGRR (Alpha, Blue, Green, Red)
-# Azul puro = A=ff, B=ff, G=00, R=00 → "ffff0000"
 ESTILOS_KML = """
-\t<!-- Trayectoria: línea azul, grosor 3 -->
+\t<!-- Trayectoria: línea ROJA, grosor 3, sin etiqueta -->
 \t<Style id="estilo_trayectoria">
 \t\t<IconStyle>
-\t\t\t<scale>1.1</scale>
+\t\t\t<scale>0</scale>
 \t\t\t<Icon>
 \t\t\t\t<href>http://maps.google.com/mapfiles/kml/pushpin/ylw-pushpin.png</href>
 \t\t\t</Icon>
-\t\t\t<hotSpot x="20" y="2" xunits="pixels" yunits="pixels"/>
 \t\t</IconStyle>
+\t\t<LabelStyle>
+\t\t\t<scale>0</scale>
+\t\t</LabelStyle>
 \t\t<LineStyle>
-\t\t\t<color>ffff0000</color>
+\t\t\t<color>ff0000ff</color>
 \t\t\t<width>3</width>
 \t\t</LineStyle>
 \t</Style>
-\t<!-- Postes: pushpin amarillo -->
+\t<!-- Postes: pushpin amarillo, sin descripción -->
 \t<Style id="estilo_poste">
 \t\t<IconStyle>
 \t\t\t<Icon>
@@ -356,31 +317,21 @@ ESTILOS_KML = """
 \t</Style>"""
 
 
-def xml_bloque_solicitud(rutas_config, placemarks_por_id, sangria="\t"):
-    """
-    Construye el bloque XML de:
-      <Folder>Solicitud
-        <Folder>Ruta 1
-          <Folder>Trayectoria ... </Folder>
-          <Folder>Postes      ... </Folder>
-        </Folder>
-        ...
-      </Folder>
+# ══════════════════════════════════════════════════════════════
+# FUNCIÓN 4: GENERAR KMZ DE SALIDA
+# ══════════════════════════════════════════════════════════════
 
-    El parámetro 'sangria' controla el nivel de indentación.
-    """
-    s = sangria  # alias corto
+def xml_bloque_solicitud(rutas_config, placemarks_por_id, sangria="\t"):
+    """Construye el bloque XML Solicitud → Ruta N → Trayectoria / Postes."""
+    s = sangria
     xml_rutas = []
 
     for num_ruta, datos in rutas_config.items():
-
-        # Placemarks de Trayectoria (líneas)
         xml_tray = ""
         for pm_id in datos["trayectoria"]:
             if pm_id in placemarks_por_id:
                 xml_tray += s + "\t\t\t" + elemento_a_string(placemarks_por_id[pm_id]["element"]) + "\n"
 
-        # Placemarks de Postes (puntos)
         xml_post = ""
         for pm_id in datos["postes"]:
             if pm_id in placemarks_por_id:
@@ -413,20 +364,14 @@ def xml_bloque_solicitud(rutas_config, placemarks_por_id, sangria="\t"):
 def generar_kmz(rutas_config, placemarks_por_id, nombre_proyecto, con_municipio=False):
     """
     Genera el KMZ final con la estructura del SEG.
-
-    - con_municipio=False → Solicitud → Ruta → Trayectoria/Postes
-    - con_municipio=True  → Entidad → Municipio → Solicitud → Ruta → Trayectoria/Postes
+      con_municipio=False → Solicitud → Ruta → Trayectoria/Postes
+      con_municipio=True  → Entidad → Municipio → Solicitud → Ruta → Trayectoria/Postes
     """
-
     if not con_municipio:
-        # ── MODO SIN MUNICIPIO ────────────────────────────────
-        solicitud_xml = xml_bloque_solicitud(rutas_config, placemarks_por_id, sangria="\t")
-        cuerpo = solicitud_xml
+        cuerpo = xml_bloque_solicitud(rutas_config, placemarks_por_id, "\t")
 
     else:
-        # ── MODO CON MUNICIPIO ────────────────────────────────
-        # Agrupar elementos asignados por municipio
-        elementos_por_mun = defaultdict(lambda: defaultdict(lambda: {"trayectoria": [], "postes": []}))
+        elems_por_mun = defaultdict(lambda: defaultdict(lambda: {"trayectoria": [], "postes": []}))
 
         for num_ruta, datos in rutas_config.items():
             for pm_id in datos["trayectoria"]:
@@ -434,24 +379,21 @@ def generar_kmz(rutas_config, placemarks_por_id, nombre_proyecto, con_municipio=
                     mun = placemarks_por_id[pm_id].get("municipio")
                     if mun:
                         clave = (mun["cve_ent"], mun["nom_ent"], mun["cve_mun"], mun["nom_mun"])
-                        elementos_por_mun[clave][num_ruta]["trayectoria"].append(pm_id)
-
+                        elems_por_mun[clave][num_ruta]["trayectoria"].append(pm_id)
             for pm_id in datos["postes"]:
                 if pm_id in placemarks_por_id:
                     mun = placemarks_por_id[pm_id].get("municipio")
                     if mun:
                         clave = (mun["cve_ent"], mun["nom_ent"], mun["cve_mun"], mun["nom_mun"])
-                        elementos_por_mun[clave][num_ruta]["postes"].append(pm_id)
+                        elems_por_mun[clave][num_ruta]["postes"].append(pm_id)
 
-        if not elementos_por_mun:
-            # Si no se detectó ningún municipio, usar estructura sin municipio
+        if not elems_por_mun:
             cuerpo = xml_bloque_solicitud(rutas_config, placemarks_por_id, "\t")
         else:
-            # Agrupar municipios por entidad
             entidades = defaultdict(list)
-            for (cve_ent, nom_ent, cve_mun, nom_mun), rutas_mun in sorted(elementos_por_mun.items()):
-                solicitud_xml = xml_bloque_solicitud(rutas_mun, placemarks_por_id, sangria="\t\t\t")
-                municipio_xml = (
+            for (cve_ent, nom_ent, cve_mun, nom_mun), rutas_mun in sorted(elems_por_mun.items()):
+                solicitud_xml  = xml_bloque_solicitud(rutas_mun, placemarks_por_id, "\t\t\t")
+                municipio_xml  = (
                     f"\t\t<Folder>\n"
                     f"\t\t\t<name>{cve_mun} - {nom_mun}</name>\n"
                     f"\t\t\t<open>1</open>\n"
@@ -470,7 +412,6 @@ def generar_kmz(rutas_config, placemarks_por_id, nombre_proyecto, con_municipio=
                     + f"\t</Folder>\n"
                 )
 
-    # ── Armar el KML completo ─────────────────────────────────
     kml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<kml xmlns="http://www.opengis.net/kml/2.2"\n'
@@ -485,7 +426,6 @@ def generar_kmz(rutas_config, placemarks_por_id, nombre_proyecto, con_municipio=
         '</kml>'
     )
 
-    # ── Empaquetar en KMZ (ZIP con el KML adentro) ────────────
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("doc.kml", kml.encode("utf-8"))
@@ -512,7 +452,7 @@ archivo_proyecto = st.file_uploader(
     "Sube el KMZ con tus trayectorias y postes",
     type=["kmz"],
     key="proyecto",
-    help="Puede tener cualquier estructura interna; la app detecta líneas y puntos automáticamente.",
+    help="Puede tener cualquier estructura interna.",
 )
 
 st.divider()
@@ -532,7 +472,6 @@ with col_up:
         "KMZ de Municipios",
         type=["kmz"],
         key="municipios",
-        help="KMZ de INEGI/CONABIO con los polígonos municipales.",
         label_visibility="collapsed",
     )
 
@@ -543,7 +482,6 @@ if not archivo_proyecto:
     st.info("👆 Sube tu KMZ del proyecto en el Paso 1 para comenzar.")
     st.stop()
 
-# Leer y parsear el KMZ del proyecto
 bytes_proyecto = archivo_proyecto.read()
 try:
     placemarks = parse_kmz_proyecto(bytes_proyecto)
@@ -555,8 +493,7 @@ lineas = [pm for pm in placemarks if pm["tipo"] == "Línea"]
 puntos = [pm for pm in placemarks if pm["tipo"] == "Punto"]
 placemarks_por_id = {pm["id"]: pm for pm in placemarks}
 
-# Resumen del archivo cargado
-st.success(f"✅ Proyecto cargado: **{len(placemarks)}** elementos encontrados")
+st.success(f"✅ Proyecto cargado: **{len(placemarks)}** elementos")
 c1, c2, c3 = st.columns(3)
 c1.metric("📏 Líneas (trayectorias)", len(lineas))
 c2.metric("📍 Puntos (postes)",        len(puntos))
@@ -574,10 +511,7 @@ con_municipio = False
 
 if archivo_municipios:
     if not SHAPELY:
-        st.error(
-            "❌ La librería **shapely** no está instalada. "
-            "Instálala con: `pip install shapely`"
-        )
+        st.error("❌ La librería **shapely** no está instalada. Agrégala al `requirements.txt`.")
     else:
         bytes_municipios = archivo_municipios.read()
         try:
@@ -589,30 +523,23 @@ if archivo_municipios:
             )
 
             with st.spinner("Calculando intersección espacial..."):
-                placemarks = calcular_interseccion(placemarks, municipios_data)
+                placemarks        = calcular_interseccion(placemarks, municipios_data)
                 placemarks_por_id = {pm["id"]: pm for pm in placemarks}
 
             con_municipio = True
 
-            # Mostrar resultados de la intersección
             st.subheader("📍 Municipios detectados por intersección")
-            detectados = [(pm, pm["municipio"]) for pm in placemarks if pm["municipio"]]
-            sin_mun    = [pm for pm in placemarks if pm["municipio"] is None]
-
-            if detectados:
-                for pm, mun in detectados:
-                    icono = "📏" if pm["tipo"] == "Línea" else "📍"
+            for pm in placemarks:
+                mun   = pm["municipio"]
+                icono = "📏" if pm["tipo"] == "Línea" else "📍"
+                if mun:
                     st.write(
                         f"{icono} **{pm['name']}** → "
                         f"`{mun['cve_ent']}` **{mun['nom_ent']}** / "
                         f"`{mun['cve_mun']}` **{mun['nom_mun']}**"
                     )
-
-            if sin_mun:
-                st.warning(
-                    f"⚠️ {len(sin_mun)} elemento(s) no se asociaron a ningún municipio: "
-                    + ", ".join(pm["name"] for pm in sin_mun)
-                )
+                else:
+                    st.warning(f"{icono} **{pm['name']}** → no se encontró municipio")
 
             st.divider()
 
@@ -625,7 +552,6 @@ st.subheader("⚙️ Paso 3 — Configura la estructura")
 nombre_proyecto = st.text_input(
     "Nombre del proyecto (sin símbolos ni comas)",
     value=archivo_proyecto.name.replace(".kmz", ""),
-    help="Este nombre aparecerá en el KMZ generado.",
 )
 
 num_rutas = st.number_input(
@@ -633,12 +559,10 @@ num_rutas = st.number_input(
     min_value=1, max_value=10, value=1, step=1,
 )
 
-# Opciones para los multiselect
 opciones_lineas = [pm["id"] for pm in lineas]
 opciones_puntos = [pm["id"] for pm in puntos]
 
 def etiqueta_elemento(pm_id):
-    """Genera la etiqueta que se muestra en los selectbox."""
     pm  = placemarks_por_id.get(pm_id, {})
     mun = pm.get("municipio")
     mun_str = f"  📍 {mun['nom_mun']}, {mun['nom_ent']}" if mun else ""
@@ -684,12 +608,9 @@ else:
     st.info("📐 Estructura: **Solicitud → Ruta → Trayectoria / Postes**  _(sin municipios)_")
 
 if st.button("🔄 Generar KMZ para el SEG", type="primary", use_container_width=True):
-    total = sum(
-        len(r["trayectoria"]) + len(r["postes"])
-        for r in rutas_config.values()
-    )
+    total = sum(len(r["trayectoria"]) + len(r["postes"]) for r in rutas_config.values())
     if total == 0:
-        st.warning("⚠️ Asigna al menos un elemento (línea o punto) a una Ruta antes de generar.")
+        st.warning("⚠️ Asigna al menos un elemento a una Ruta antes de generar.")
     elif not nombre_proyecto.strip():
         st.warning("⚠️ Escribe el nombre del proyecto.")
     else:
