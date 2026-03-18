@@ -56,35 +56,69 @@ def coords_str_to_list(coords_str):
     return coords
 
 
+# ─── Estilos inline que se inyectan directamente en cada Placemark ───────────
+# Usar estilos inline garantiza que Google Earth los aplique siempre,
+# sin importar los estilos que traía el KMZ original.
+#
+# Color KML usa formato AABBGGRR:   Rojo = ff0000ff
+
+_ESTILO_LINEA = (
+    "<Style>"
+    "<LineStyle><color>ff0000ff</color><width>3</width></LineStyle>"
+    "<LabelStyle><scale>0</scale></LabelStyle>"
+    "</Style>"
+)
+
+_ESTILO_PUNTO = (
+    "<Style>"
+    "<IconStyle>"
+    "<Icon><href>http://maps.google.com/mapfiles/kml/pushpin/ylw-pushpin.png</href></Icon>"
+    "<hotSpot x='20' y='2' xunits='pixels' yunits='pixels'/>"
+    "</IconStyle>"
+    "<LabelStyle><scale>0.8</scale></LabelStyle>"
+    "</Style>"
+)
+
+
 def elemento_a_string(elemento):
     """
-    Convierte un elemento XML a string KML limpio:
-      - Quita prefijos de namespace (kml:, ns0:)
-      - Elimina el bloque <description> completo  ← sin descripción
-      - Actualiza <styleUrl> según el tipo de geometría
+    Convierte un Placemark a string KML limpio:
+      1. Convierte el elemento XML a texto
+      2. Elimina prefijos de namespace (kml:, ns0:)
+      3. Elimina TODO bloque <description> (incluyendo CDATA)
+      4. Elimina <styleUrl> y <Style> originales del Placemark
+      5. Inyecta un nuevo <Style> inline con el color y grosor correcto
     """
     texto = ET.tostring(elemento, encoding="unicode")
 
-    # Limpiar declaraciones de namespace extra
+    # ── 1. Limpiar prefijos de namespace ──────────────────────
     texto = re.sub(r' xmlns(?::\w+)?="[^"]*"', "", texto)
-    # Quitar prefijo kml: si quedó
     texto = re.sub(r"<kml:", "<", texto)
     texto = re.sub(r"</kml:", "</", texto)
 
-    # ── Quitar <description> con todo su contenido ────────────
-    texto = re.sub(r"<description>.*?</description>", "", texto, flags=re.DOTALL)
+    # ── 2. Quitar <description> con TODO su contenido ─────────
+    #    Incluye descripciones normales y con CDATA
+    texto = re.sub(r"<description\b[^>]*>.*?</description>", "", texto, flags=re.DOTALL)
     texto = re.sub(r"<description\s*/>", "", texto)
 
-    # ── Actualizar styleUrl según tipo de geometría ───────────
+    # ── 3. Quitar <styleUrl> y <Style> del Placemark original ─
+    #    Sin esto, el estilo viejo puede sobrescribir el nuevo
+    texto = re.sub(r"<styleUrl\b[^>]*>.*?</styleUrl>", "", texto, flags=re.DOTALL)
+    texto = re.sub(r"<Style\b[^>]*>.*?</Style>",       "", texto, flags=re.DOTALL)
+    texto = re.sub(r"<StyleMap\b[^>]*>.*?</StyleMap>", "", texto, flags=re.DOTALL)
+
+    # ── 4. Inyectar estilo inline después del tag <Placemark...> ──
+    #    Se usa lambda para que re.sub no interprete los backslashes
     if "<LineString>" in texto:
-        nuevo_estilo = "#estilo_trayectoria"
+        estilo_inline = _ESTILO_LINEA
     else:
-        nuevo_estilo = "#estilo_poste"
+        estilo_inline = _ESTILO_PUNTO
 
     texto = re.sub(
-        r"<styleUrl>[^<]*</styleUrl>",
-        f"<styleUrl>{nuevo_estilo}</styleUrl>",
-        texto
+        r"(<Placemark\b[^>]*>)",
+        lambda m: m.group(1) + estilo_inline,
+        texto,
+        count=1,
     )
 
     return texto
