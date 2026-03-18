@@ -9,25 +9,6 @@ Estructura de salida:
   Con municipios:  Entidad → Municipio → Solicitud → Ruta N → Trayectoria / Postes
 """
 
-# ─── Instalación automática de dependencias ──────────────────
-# Si shapely no está instalada, la instalamos automáticamente.
-# Esto evita que el usuario tenga que correr pip manualmente.
-import subprocess
-import sys
-
-def _instalar_si_falta(paquete):
-    """Instala un paquete de Python si no está disponible."""
-    try:
-        __import__(paquete)
-    except ImportError:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", paquete, "--quiet"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-_instalar_si_falta("shapely")
-
 import streamlit as st
 import zipfile
 import xml.etree.ElementTree as ET
