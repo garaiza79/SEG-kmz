@@ -84,9 +84,10 @@ _ESTILO_PUNTO = (
 )
 
 
-def elemento_a_string(elemento):
+def elemento_a_string(elemento, nombre_override=None):
     """
     Convierte un Placemark a string KML limpio con estilo inline inyectado.
+    Si nombre_override está definido, reemplaza el <name> original por ese valor.
     """
     texto = ET.tostring(elemento, encoding="unicode")
 
@@ -120,6 +121,16 @@ def elemento_a_string(elemento):
         texto,
         count=1,
     )
+
+    # ── 5. Renombrar el elemento si se pidió ──────────────────
+    if nombre_override is not None:
+        texto = re.sub(
+            r"<name\b[^>]*>.*?</name>",
+            f"<name>{nombre_override}</name>",
+            texto,
+            count=1,
+            flags=re.DOTALL,
+        )
 
     return texto
 
@@ -338,9 +349,13 @@ def xml_bloque_solicitud(rutas_config, placemarks_por_id, sangria="\t"):
                 xml_tray += s + "\t\t\t" + elemento_a_string(placemarks_por_id[pm_id]["element"]) + "\n"
 
         xml_post = ""
-        for pm_id in datos["postes"]:
+        for i, pm_id in enumerate(datos["postes"], start=1):
             if pm_id in placemarks_por_id:
-                xml_post += s + "\t\t\t" + elemento_a_string(placemarks_por_id[pm_id]["element"]) + "\n"
+                nombre_poste = f"Poste {i:02d}"
+                xml_post += s + "\t\t\t" + elemento_a_string(
+                    placemarks_por_id[pm_id]["element"],
+                    nombre_override=nombre_poste,
+                ) + "\n"
 
         xml_rutas.append(
             f"{s}\t<Folder>\n"
