@@ -469,19 +469,25 @@ def _color_elemento(pm_id, selections):
 def construir_mapa(placemarks, selections):
     """
     Construye el mapa Folium con todos los elementos coloreados según su asignación.
-    Gris = sin asignar · Color = asignado a una ruta
+    Gris = sin asignar · Color = asignado a una ruta.
+    Auto-encuadra el mapa para mostrar todos los elementos.
     """
-    # Calcular centro
+    # Recopilar todas las coordenadas para calcular bounds
     all_coords = []
     for pm in placemarks:
         if pm["coords"]:
             all_coords.extend(pm["coords"])
 
     if all_coords:
-        center_lat = sum(c[1] for c in all_coords) / len(all_coords)
-        center_lon = sum(c[0] for c in all_coords) / len(all_coords)
+        lats = [c[1] for c in all_coords]
+        lons = [c[0] for c in all_coords]
+        center_lat = sum(lats) / len(lats)
+        center_lon = sum(lons) / len(lons)
+        sw = [min(lats), min(lons)]
+        ne = [max(lats), max(lons)]
     else:
         center_lat, center_lon = 23.0, -102.0
+        sw, ne = None, None
 
     m = folium.Map(
         location=[center_lat, center_lon],
@@ -489,49 +495,52 @@ def construir_mapa(placemarks, selections):
         tiles="OpenStreetMap",
     )
 
+    # Auto-encuadrar al área de los datos
+    if sw and ne:
+        m.fit_bounds([sw, ne], padding=[30, 30])
+
     for pm in placemarks:
         if not pm["coords"]:
             continue
 
         color, asign_label = _color_elemento(pm["id"], selections)
-        # Popup con ID parseable + nombre + etiqueta
-        popup_txt = f"ID:{pm['id']}|{pm['name']}|{asign_label}"
-        tooltip_txt = f"{pm['name']}\n{asign_label}"
+        tooltip_txt = f"{pm['name']} — {asign_label}"
 
         if pm["tipo"] == "Línea" and len(pm["coords"]) >= 2:
-            # Dibujar la línea
+            # Grosor mayor si está asignado
+            peso = 5 if color != "#888888" else 3
             folium.PolyLine(
                 locations=[(c[1], c[0]) for c in pm["coords"]],
                 color=color,
-                weight=4,
-                opacity=0.85,
+                weight=peso,
+                opacity=0.9,
                 tooltip=folium.Tooltip(tooltip_txt),
-                popup=folium.Popup(popup_txt, max_width=300),
             ).add_to(m)
-            # Marcador en punto medio para facilitar clic
-            mid = pm["coords"][len(pm["coords"]) // 2]
+            # Marcador de inicio de línea para mejor visibilidad
+            inicio = pm["coords"][0]
             folium.CircleMarker(
-                location=[mid[1], mid[0]],
-                radius=7,
+                location=[inicio[1], inicio[0]],
+                radius=5,
                 color=color,
                 fill=True,
                 fill_color=color,
-                fill_opacity=0.9,
+                fill_opacity=0.8,
                 tooltip=folium.Tooltip(tooltip_txt),
-                popup=folium.Popup(popup_txt, max_width=300),
             ).add_to(m)
 
         elif pm["tipo"] == "Punto":
             coord = pm["coords"][0]
+            # Radio mayor y borde más visible si está asignado
+            radio = 9 if color != "#888888" else 6
             folium.CircleMarker(
                 location=[coord[1], coord[0]],
-                radius=8,
-                color=color,
+                radius=radio,
+                color="#333333" if color == "#888888" else color,
+                weight=2,
                 fill=True,
                 fill_color=color,
-                fill_opacity=0.9,
+                fill_opacity=0.85,
                 tooltip=folium.Tooltip(tooltip_txt),
-                popup=folium.Popup(popup_txt, max_width=300),
             ).add_to(m)
 
     return m
@@ -662,9 +671,9 @@ if archivo_municipios:
 
 
 # ══════════════════════════════════════════════════════════════
-# ── PASO 3: Mapa interactivo para seleccionar elementos ───────
+# ── PASO 3: Lista de selección + mapa de referencia visual ────
 # ══════════════════════════════════════════════════════════════
-st.subheader("⚙️ Paso 3 — Selecciona los elementos en el mapa")
+st.subheader("⚙️ Paso 3 — Asigna elementos a cada ruta")
 
 # ─── Número de rutas ──────────────────────────────────────────
 num_rutas = st.number_input(
@@ -674,233 +683,110 @@ num_rutas = st.number_input(
 )
 num_rutas = int(num_rutas)
 
-# ─── Inicializar / sincronizar session_state ──────────────────
-if "selections" not in st.session_state:
-    st.session_state["selections"] = {}
+# ─── Etiqueta para cada elemento ──────────────────────────────
+def etiqueta_elemento(pm_id):
+    pm  = placemarks_por_id.get(pm_id, {})
+    mun = pm.get("municipio")
+    mun_str = f"  📍 {mun['nom_mun']}, {mun['nom_ent']}" if mun else ""
+    return f"{pm.get('name', pm_id)}{mun_str}   (📁 {pm.get('path', '')})"
 
-for rn in range(1, num_rutas + 1):
-    if rn not in st.session_state["selections"]:
-        st.session_state["selections"][rn] = {"trayectoria": set(), "postes": set()}
+opciones_lineas = [pm["id"] for pm in lineas]
+opciones_puntos = [pm["id"] for pm in puntos]
 
-# Limpiar rutas que ya no existen
-for rn in list(st.session_state["selections"].keys()):
-    if rn > num_rutas:
-        del st.session_state["selections"][rn]
+# ─── Layout: lista izquierda | mapa derecha ───────────────────
+col_lista, col_mapa = st.columns([2, 3])
 
-if "ruta_activa" not in st.session_state:
-    st.session_state["ruta_activa"] = 1
-if "tipo_activo" not in st.session_state:
-    st.session_state["tipo_activo"] = "postes"
-if "last_click_popup" not in st.session_state:
-    st.session_state["last_click_popup"] = None
+# ══ COLUMNA IZQUIERDA: listas de selección ════════════════════
+with col_lista:
+    st.markdown("**Selecciona los elementos para cada ruta:**")
+    st.caption("Los elementos seleccionados se resaltan en el mapa con el color de su ruta.")
 
-# Asegurar que ruta_activa esté dentro del rango
-if st.session_state["ruta_activa"] > num_rutas:
-    st.session_state["ruta_activa"] = 1
-
-# ─── Layout: columna mapa | columna panel ─────────────────────
-if not FOLIUM:
-    st.error(
-        "❌ Las librerías **folium** y **streamlit-folium** no están instaladas. "
-        "Agrégalas al `requirements.txt`:\n```\nfolium\nstreamlit-folium\n```"
-    )
-    # Fallback: multiselect clásico
-    opciones_lineas = [pm["id"] for pm in lineas]
-    opciones_puntos = [pm["id"] for pm in puntos]
-
-    def etiqueta_fallback(pm_id):
-        pm = placemarks_por_id.get(pm_id, {})
-        return f"{pm.get('name', pm_id)}   (📁 {pm.get('path', '')})"
-
-    rutas_config_fallback = {}
+    rutas_config = {}
     for num_ruta in range(1, num_rutas + 1):
-        st.markdown(f"#### 📂 Ruta {num_ruta}")
-        col_t, col_p = st.columns(2)
-        with col_t:
-            st.markdown("**Trayectoria** — líneas")
-            sel_tray = st.multiselect(
-                f"tray_{num_ruta}", options=opciones_lineas,
-                format_func=etiqueta_fallback,
-                key=f"tray_fb_{num_ruta}", label_visibility="collapsed",
-            )
-        with col_p:
-            st.markdown("**Postes** — puntos")
-            sel_postes = st.multiselect(
-                f"postes_{num_ruta}", options=opciones_puntos,
-                format_func=etiqueta_fallback,
-                key=f"post_fb_{num_ruta}", label_visibility="collapsed",
-            )
-        rutas_config_fallback[num_ruta] = {"trayectoria": sel_tray, "postes": sel_postes}
-
-    rutas_config = rutas_config_fallback
-
-else:
-    # ══ MAPA INTERACTIVO ══════════════════════════════════════
-    col_mapa, col_panel = st.columns([3, 2])
-
-    # ─── Panel derecho ────────────────────────────────────────
-    with col_panel:
-        st.markdown("### Panel de asignación")
-
-        ruta_activa = st.selectbox(
-            "Ruta activa",
-            options=list(range(1, num_rutas + 1)),
-            format_func=lambda x: f"Ruta {x}",
-            index=min(st.session_state["ruta_activa"] - 1, num_rutas - 1),
-            key="ruta_activa_select",
-        )
-        st.session_state["ruta_activa"] = ruta_activa
-
-        tipo_activo = st.radio(
-            "Tipo de elemento",
-            options=["postes", "trayectoria"],
-            format_func=lambda x: "📍 Postes" if x == "postes" else "📏 Trayectoria",
-            index=0 if st.session_state["tipo_activo"] == "postes" else 1,
-            key="tipo_activo_radio",
-            horizontal=True,
-        )
-        st.session_state["tipo_activo"] = tipo_activo
-
-        color_activo = COLORES_RUTA[(ruta_activa - 1) % len(COLORES_RUTA)]
-        tipo_label   = "Postes" if tipo_activo == "postes" else "Trayectoria"
+        color_rn = COLORES_RUTA[(num_ruta - 1) % len(COLORES_RUTA)]
         st.markdown(
-            f"<div style='background:{color_activo};padding:8px 12px;border-radius:6px;"
-            f"color:white;font-weight:bold;text-align:center;margin:6px 0'>"
-            f"➕ Clic en mapa → Ruta {ruta_activa} / {tipo_label}"
-            f"</div>",
+            f"<div style='display:flex;align-items:center;gap:8px;margin:14px 0 4px'>"
+            f"<span style='display:inline-block;width:14px;height:14px;background:{color_rn};"
+            f"border-radius:50%;flex-shrink:0'></span>"
+            f"<strong>Ruta {num_ruta}</strong></div>",
             unsafe_allow_html=True,
         )
-        st.caption("Haz clic de nuevo en un elemento para quitarlo.")
 
-        st.markdown("---")
-
-        # Mostrar elementos asignados por ruta
-        total_global = sum(
-            len(d.get("trayectoria", set())) + len(d.get("postes", set()))
-            for d in st.session_state["selections"].values()
+        sel_tray = st.multiselect(
+            "📏 Trayectoria (líneas)",
+            options=opciones_lineas,
+            format_func=etiqueta_elemento,
+            key=f"tray_{num_ruta}",
+            placeholder="Selecciona líneas...",
         )
-        st.markdown(f"**Total asignados: {total_global}**")
 
-        for rn in range(1, num_rutas + 1):
-            sel_rn   = st.session_state["selections"].get(rn, {})
-            tray_ids = list(sel_rn.get("trayectoria", set()))
-            post_ids = list(sel_rn.get("postes", set()))
-            total_rn = len(tray_ids) + len(post_ids)
-            color_rn = COLORES_RUTA[(rn - 1) % len(COLORES_RUTA)]
+        sel_postes = st.multiselect(
+            "📍 Postes (puntos)",
+            options=opciones_puntos,
+            format_func=etiqueta_elemento,
+            key=f"post_{num_ruta}",
+            placeholder="Selecciona postes...",
+        )
 
-            header_html = (
-                f"<span style='display:inline-block;width:12px;height:12px;"
-                f"background:{color_rn};border-radius:50%;margin-right:6px'></span>"
-                f"Ruta {rn} · {total_rn} elemento{'s' if total_rn != 1 else ''}"
-            )
+        rutas_config[num_ruta] = {"trayectoria": sel_tray, "postes": sel_postes}
 
-            with st.expander(f"Ruta {rn} · {total_rn} elementos", expanded=(rn == ruta_activa)):
-                if tray_ids:
-                    st.markdown("**📏 Trayectoria:**")
-                    for pm_id in tray_ids:
-                        pm = placemarks_por_id.get(pm_id, {})
-                        c1, c2 = st.columns([5, 1])
-                        c1.caption(pm.get("name", str(pm_id)))
-                        if c2.button("✕", key=f"rm_tray_{rn}_{pm_id}", help="Quitar"):
-                            st.session_state["selections"][rn]["trayectoria"].discard(pm_id)
-                            st.rerun()
+    # Resumen de asignaciones
+    total_asignados = sum(
+        len(r["trayectoria"]) + len(r["postes"]) for r in rutas_config.values()
+    )
+    if total_asignados > 0:
+        st.success(f"✅ {total_asignados} elemento(s) asignados en total")
+    else:
+        st.info("⬆️ Selecciona elementos en las listas de arriba.")
 
-                if post_ids:
-                    st.markdown("**📍 Postes:**")
-                    for pm_id in post_ids:
-                        pm = placemarks_por_id.get(pm_id, {})
-                        c1, c2 = st.columns([5, 1])
-                        c1.caption(pm.get("name", str(pm_id)))
-                        if c2.button("✕", key=f"rm_post_{rn}_{pm_id}", help="Quitar"):
-                            st.session_state["selections"][rn]["postes"].discard(pm_id)
-                            st.rerun()
+# ══ COLUMNA DERECHA: mapa de referencia ═══════════════════════
+with col_mapa:
+    st.markdown("**Mapa de referencia visual:**")
 
-                if not tray_ids and not post_ids:
-                    st.caption("Sin elementos asignados.")
+    if not FOLIUM:
+        st.warning(
+            "⚠️ Instala **folium** y **streamlit-folium** en `requirements.txt` "
+            "para ver el mapa de referencia."
+        )
+    else:
+        # Construir selecciones en formato de sets para el mapa
+        selections_mapa = {
+            rn: {
+                "trayectoria": set(rutas_config[rn]["trayectoria"]),
+                "postes":      set(rutas_config[rn]["postes"]),
+            }
+            for rn in rutas_config
+        }
 
-    # ─── Mapa izquierdo ───────────────────────────────────────
-    with col_mapa:
-        mapa = construir_mapa(placemarks, st.session_state["selections"])
-        resultado_mapa = st_folium(
+        mapa = construir_mapa(placemarks, selections_mapa)
+        st_folium(
             mapa,
             width=700,
-            height=520,
-            returned_objects=["last_object_clicked_popup"],
-            key="mapa_principal",
+            height=500,
+            returned_objects=[],   # solo visual, sin procesar clics
+            key="mapa_referencia",
         )
 
-        # ── Procesar clic en el mapa ──────────────────────────
-        popup_click = (
-            resultado_mapa.get("last_object_clicked_popup")
-            if resultado_mapa else None
-        )
-
-        if (
-            popup_click
-            and isinstance(popup_click, str)
-            and popup_click != st.session_state.get("last_click_popup")
-        ):
-            st.session_state["last_click_popup"] = popup_click
-
-            if popup_click.startswith("ID:"):
-                partes = popup_click.split("|")
-                try:
-                    pm_id    = int(partes[0].replace("ID:", "").strip())
-                    ruta_num = st.session_state["ruta_activa"]
-                    tipo     = st.session_state["tipo_activo"]
-
-                    if ruta_num not in st.session_state["selections"]:
-                        st.session_state["selections"][ruta_num] = {
-                            "trayectoria": set(), "postes": set()
-                        }
-
-                    sel_set = st.session_state["selections"][ruta_num][tipo]
-
-                    if pm_id in sel_set:
-                        # Toggle: quitar
-                        sel_set.discard(pm_id)
-                        st.toast(f"✕ Quitado de Ruta {ruta_num} / {tipo_label}")
-                    else:
-                        # Quitar de cualquier asignación anterior
-                        for otras in st.session_state["selections"].values():
-                            otras["trayectoria"].discard(pm_id)
-                            otras["postes"].discard(pm_id)
-                        # Asignar
-                        sel_set.add(pm_id)
-                        st.toast(f"✓ Asignado a Ruta {ruta_num} / {tipo_label}")
-
-                    st.rerun()
-
-                except (ValueError, IndexError):
-                    pass
-
-        # Leyenda de colores
+        # Leyenda
         leyenda_items = []
         for rn in range(1, num_rutas + 1):
             c = COLORES_RUTA[(rn - 1) % len(COLORES_RUTA)]
             leyenda_items.append(
-                f"<span style='display:inline-flex;align-items:center;margin-right:12px'>"
-                f"<span style='display:inline-block;width:14px;height:14px;background:{c};"
+                f"<span style='display:inline-flex;align-items:center;margin-right:10px'>"
+                f"<span style='display:inline-block;width:12px;height:12px;background:{c};"
                 f"border-radius:50%;margin-right:4px'></span>Ruta {rn}</span>"
             )
         leyenda_items.append(
             "<span style='display:inline-flex;align-items:center'>"
-            "<span style='display:inline-block;width:14px;height:14px;background:#888888;"
+            "<span style='display:inline-block;width:12px;height:12px;background:#888888;"
             "border-radius:50%;margin-right:4px'></span>Sin asignar</span>"
         )
         st.markdown(
-            "<div style='margin-top:6px;font-size:0.82em'>" + "".join(leyenda_items) + "</div>",
+            "<div style='font-size:0.82em;margin-top:4px'>"
+            + "".join(leyenda_items)
+            + "</div>",
             unsafe_allow_html=True,
         )
-
-    # Construir rutas_config desde session_state
-    rutas_config = {}
-    for rn in range(1, num_rutas + 1):
-        sel = st.session_state["selections"].get(rn, {})
-        rutas_config[rn] = {
-            "trayectoria": list(sel.get("trayectoria", set())),
-            "postes":      list(sel.get("postes", set())),
-        }
 
 
 st.divider()
@@ -921,7 +807,7 @@ else:
 if st.button("🔄 Generar KMZ para el SEG", type="primary", use_container_width=True):
     total = sum(len(r["trayectoria"]) + len(r["postes"]) for r in rutas_config.values())
     if total == 0:
-        st.warning("⚠️ Asigna al menos un elemento en el mapa antes de generar.")
+        st.warning("⚠️ Asigna al menos un elemento en las listas del Paso 3 antes de generar.")
     elif not nombre_proyecto.strip():
         st.warning("⚠️ Escribe el nombre del proyecto.")
     else:
